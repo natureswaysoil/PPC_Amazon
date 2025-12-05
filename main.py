@@ -188,56 +188,53 @@ class Config:
 # ============================================================================
 # AUDIT LOGGER
 # ============================================================================
-
 class AuditLogger:
-    def __init__(self, output_dir: str = "."):
-        self.output_dir = output_dir
-        self.filename = os.path.join(
-            output_dir,
-            f"ppc_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-        self.entries: List[AuditEntry] = []
+    """BigQuery-based audit logger"""
     
-    def log(self, action_type: str, entity_type: str, entity_id: str,
-            old_value: str, new_value: str, reason: str, dry_run: bool = False):
-        entry = AuditEntry(
-            timestamp=datetime.utcnow().isoformat(),
-            action_type=action_type,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            old_value=str(old_value),
-            new_value=str(new_value),
-            reason=reason,
-            dry_run=dry_run
-        )
+    def __init__(self, project_id, dataset_id, table_id):
+        self.client = bigquery.Client(project=project_id)
+        self.table_ref = f"{project_id}.{dataset_id}.{table_id}"
+        self.entries = []
+        
+        # Ensure table exists (schema definition)
+        schema = [
+            bigquery.SchemaField("timestamp", "TIMESTAMP"),
+            bigquery.SchemaField("action_type", "STRING"),
+            bigquery.SchemaField("entity_type", "STRING"),
+            bigquery.SchemaField("entity_id", "STRING"),
+            bigquery.SchemaField("old_value", "STRING"),
+            bigquery.SchemaField("new_value", "STRING"),
+            bigquery.SchemaField("reason", "STRING"),
+            bigquery.SchemaField("dry_run", "BOOLEAN"),
+        ]
+        try:
+            self.client.create_table(bigquery.Table(self.table_ref, schema=schema), exists_ok=True)
+        except Exception as e:
+            print(f"Table setup warning: {e}")
+
+    def log(self, action_type, entity_type, entity_id, old_value, new_value, reason, dry_run=False):
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "action_type": action_type,
+            "entity_type": entity_type,
+            "entity_id": str(entity_id),
+            "old_value": str(old_value),
+            "new_value": str(new_value),
+            "reason": str(reason),
+            "dry_run": dry_run
+        }
         self.entries.append(entry)
-    
+
     def save(self):
         if not self.entries:
             return
         
-        try:
-            with open(self.filename, 'w', newline='', encoding='utf-8') as f:
-                fieldnames = ['timestamp', 'action_type', 'entity_type', 'entity_id',
-                             'old_value', 'new_value', 'reason', 'dry_run']
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for entry in self.entries:
-                    writer.writerow({
-                        'timestamp': entry.timestamp,
-                        'action_type': entry.action_type,
-                        'entity_type': entry.entity_type,
-                        'entity_id': entry.entity_id,
-                        'old_value': entry.old_value,
-                        'new_value': entry.new_value,
-                        'reason': entry.reason,
-                        'dry_run': entry.dry_run
-                    })
-            
-            logger.info(f"Audit trail saved to {self.filename} ({len(self.entries)} entries)")
-        except Exception as e:
-            logger.error(f"Failed to save audit trail: {e}")
+        errors = self.client.insert_rows_json(self.table_ref, self.entries)
+        if errors == []:
+            print(f"Successfully uploaded {len(self.entries)} rows to BigQuery.")
+        else:
+            print(f"Encountered errors while inserting rows: {errors}")
+
 
 # ============================================================================
 # AMAZON ADS API CLIENT
