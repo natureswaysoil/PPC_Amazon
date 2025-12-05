@@ -751,7 +751,46 @@ class CampaignManager:
 # ============================================================================
 # MAIN ORCHESTRATOR
 # ============================================================================
+class PPCAutomation:
+    def __init__(self, config_path: str, profile_id: str, dry_run: bool = False):
+        self.config = Config(config_path)
+        self.profile_id = profile_id
+        self.dry_run = dry_run
+        region = self.config.get('api.region', 'NA')
+        self.api = AmazonAdsAPI(profile_id, region)
+        
+        # -------------------------------------------------------
+        # 👇 THIS IS THE UPDATE YOU NEED TO MAKE
+        # -------------------------------------------------------
+        self.audit = AuditLogger("natureswaysoil-video", "amazon_ppc", "audit_logs")
+        # -------------------------------------------------------
 
+        self.bid_optimizer = BidOptimizer(self.config, self.api, self.audit)
+        self.dayparting = DaypartingManager(self.config, self.api, self.audit)
+        self.campaign_manager = CampaignManager(self.config, self.api, self.audit)
+        # (If you have keyword_discovery or negative_keywords classes, they go here too)
+
+    def run(self, features: List[str] = None):
+        logger.info(f"=== STARTING AUTOMATION (Profile: {self.profile_id}) ===")
+        if features is None:
+            features = self.config.get('features.enabled', [])
+        
+        results = {}
+        try:
+            if 'bid_optimization' in features:
+                results['bid_optimization'] = self.bid_optimizer.optimize(self.dry_run)
+            if 'dayparting' in features:
+                results['dayparting'] = self.dayparting.apply_dayparting(self.dry_run)
+            if 'campaign_management' in features:
+                results['campaign_management'] = self.campaign_manager.manage_campaigns(self.dry_run)
+        except Exception as e:
+            logger.error(f"Automation failed: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            # This saves the data to BigQuery
+            self.audit.save()
+        
+        return results
 class PPCAutomation:
     def __init__(self, config_path: str, profile_id: str, dry_run: bool = False):
         self.config = Config(config_path)
