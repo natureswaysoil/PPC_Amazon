@@ -2,7 +2,7 @@
 """
 Amazon PPC Automation Suite
 ===========================
-Fixed & Updated for API V3 Reporting
+Fixed & Updated for API V3 Reporting + BigQuery Logging
 """
 
 import argparse
@@ -22,6 +22,13 @@ import gzip
 import traceback
 
 import requests
+
+# --- ADDED BIGQUERY IMPORT ---
+try:
+    from google.cloud import bigquery
+except ImportError:
+    print("ERROR: google-cloud-bigquery is required. Install with: pip install google-cloud-bigquery")
+    sys.exit(1)
 
 try:
     import yaml
@@ -168,7 +175,6 @@ class Config:
             return config
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
-            # Return empty dict instead of exiting to allow safe fallback
             return {}
     
     def get(self, key: str, default=None):
@@ -186,7 +192,7 @@ class Config:
         return value if value is not None else default
 
 # ============================================================================
-# AUDIT LOGGER
+# AUDIT LOGGER (BIGQUERY VERSION)
 # ============================================================================
 class AuditLogger:
     """BigQuery-based audit logger"""
@@ -357,8 +363,7 @@ class AmazonAdsAPI:
 
     def update_campaign(self, campaign_id: str, updates: Dict) -> bool:
         try:
-            # V2 API fallback for simple updates is often safer, but V3 preferred
-            # Using V2 endpoint for simplicity as it's still widely supported for simple state toggle
+            # V2 API fallback for simple updates is often safer
             response = self._request('PUT', f'/v2/sp/campaigns/{campaign_id}', json=updates)
             return True
         except Exception as e:
@@ -443,7 +448,6 @@ class AmazonAdsAPI:
     
     def create_keywords(self, keywords_data: List[Dict]) -> List[str]:
         try:
-            # Using V2 for creation as structure is simpler
             response = self._request('POST', '/v2/sp/keywords', json=keywords_data)
             result = response.json()
             created_ids = []
@@ -488,13 +492,11 @@ class AmazonAdsAPI:
             if report_date is None:
                 report_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
             else:
-                # Ensure date is YYYY-MM-DD for V3
                 if len(report_date) == 8: # YYYYMMDD
                     report_date = f"{report_date[:4]}-{report_date[4:6]}-{report_date[6:]}"
 
-            # Map internal report types to V3 reportTypeIds
             type_map = {
-                'keywords': 'spTargeting', # usually targeting is used for keyword performance
+                'keywords': 'spTargeting',
                 'campaigns': 'spCampaigns',
                 'targets': 'spSearchTerm' if segment == 'query' else 'spTargeting'
             }
@@ -514,13 +516,12 @@ class AmazonAdsAPI:
                 }
             }
             
-            # Adjust for Search Term report
             if v3_report_type == 'spSearchTerm':
                 payload['configuration']['groupBy'] = ["campaign", "adGroup", "searchTerm"]
                 payload['configuration']['reportTypeId'] = "spSearchTerm"
 
             headers = {
-               "Content-Type": "application/vnd.createasyncreportrequest.v3+json"
+                "Content-Type": "application/vnd.createasyncreportrequest.v3+json"
             }
 
             response = self._request('POST', '/reporting/reports', json=payload, headers=headers)
@@ -561,13 +562,11 @@ class AmazonAdsAPI:
             response = requests.get(report_url, timeout=60)
             response.raise_for_status()
             
-            # V3 reports are GZIP_JSON by default
             try:
                 with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as gz:
                     json_data = json.load(gz)
                     return json_data
             except Exception:
-                 # Fallback if not gzipped or just raw json
                 return json.loads(response.content)
                 
         except Exception as e:
@@ -575,7 +574,7 @@ class AmazonAdsAPI:
             return []
 
 # ============================================================================
-# AUTOMATION FEATURES (UNCHANGED LOGIC, JUST CONNECTED TO NEW API)
+# AUTOMATION FEATURES
 # ============================================================================
 
 class BidOptimizer:
@@ -588,7 +587,6 @@ class BidOptimizer:
         logger.info("=== Starting Bid Optimization ===")
         results = {'keywords_analyzed': 0, 'bids_increased': 0, 'bids_decreased': 0, 'no_change': 0}
         
-        # V3 Metric names usually camelCase
         metrics_list = ['campaignId', 'adGroupId', 'keywordId', 'impressions', 'clicks', 'cost', 'attributedSales14d', 'attributedUnitsOrdered14d']
         
         report_id = self.api.create_report('keywords', metrics_list)
@@ -751,6 +749,7 @@ class CampaignManager:
 # ============================================================================
 # MAIN ORCHESTRATOR
 # ============================================================================
+
 class PPCAutomation:
     def __init__(self, config_path: str, profile_id: str, dry_run: bool = False):
         self.config = Config(config_path)
@@ -760,45 +759,11 @@ class PPCAutomation:
         self.api = AmazonAdsAPI(profile_id, region)
         
         # -------------------------------------------------------
-        # 👇 THIS IS THE UPDATE YOU NEED TO MAKE
+        # BIGQUERY CONNECTED HERE
         # -------------------------------------------------------
         self.audit = AuditLogger("natureswaysoil-video", "amazon_ppc", "audit_logs")
         # -------------------------------------------------------
 
-        self.bid_optimizer = BidOptimizer(self.config, self.api, self.audit)
-        self.dayparting = DaypartingManager(self.config, self.api, self.audit)
-        self.campaign_manager = CampaignManager(self.config, self.api, self.audit)
-        # (If you have keyword_discovery or negative_keywords classes, they go here too)
-
-    def run(self, features: List[str] = None):
-        logger.info(f"=== STARTING AUTOMATION (Profile: {self.profile_id}) ===")
-        if features is None:
-            features = self.config.get('features.enabled', [])
-        
-        results = {}
-        try:
-            if 'bid_optimization' in features:
-                results['bid_optimization'] = self.bid_optimizer.optimize(self.dry_run)
-            if 'dayparting' in features:
-                results['dayparting'] = self.dayparting.apply_dayparting(self.dry_run)
-            if 'campaign_management' in features:
-                results['campaign_management'] = self.campaign_manager.manage_campaigns(self.dry_run)
-        except Exception as e:
-            logger.error(f"Automation failed: {e}")
-            logger.error(traceback.format_exc())
-        finally:
-            # This saves the data to BigQuery
-            self.audit.save()
-        
-        return results
-class PPCAutomation:
-    def __init__(self, config_path: str, profile_id: str, dry_run: bool = False):
-        self.config = Config(config_path)
-        self.profile_id = profile_id
-        self.dry_run = dry_run
-        region = self.config.get('api.region', 'NA')
-        self.api = AmazonAdsAPI(profile_id, region)
-        self.audit = AuditLogger()
         self.bid_optimizer = BidOptimizer(self.config, self.api, self.audit)
         self.dayparting = DaypartingManager(self.config, self.api, self.audit)
         self.campaign_manager = CampaignManager(self.config, self.api, self.audit)
@@ -825,7 +790,7 @@ class PPCAutomation:
         return results
 
 # ============================================================================
-# DASHBOARD WRAPPER (FIXED)
+# DASHBOARD WRAPPER
 # ============================================================================
 class PPCOptimizer:
     """Wrapper for dashboards."""
@@ -839,13 +804,11 @@ class PPCOptimizer:
         except Exception:
             pass
         
-        # Ensure env vars are loaded for the API client
         if os.getenv('AMAZON_CLIENT_ID'):
             self.client_id = os.getenv('AMAZON_CLIENT_ID')
             self.profile_id = os.getenv('AMAZON_PROFILE_ID')
             self.region = os.getenv('AMAZON_REGION', 'NA')
         else:
-            # Fallback to config file if env vars missing
             api_cfg = self.config.get('amazon_api', {})
             os.environ['AMAZON_CLIENT_ID'] = api_cfg.get('client_id', '')
             os.environ['AMAZON_CLIENT_SECRET'] = api_cfg.get('client_secret', '')
@@ -856,10 +819,7 @@ class PPCOptimizer:
     def get_summary_metrics(self) -> dict:
         if self.profile_id and self.profile_id != 'YOUR_PROFILE_ID_HERE':
             try:
-                # FIX: Instantiate correctly using profile_id and region
-                # The class reads credentials from os.environ
                 api = AmazonAdsAPI(self.profile_id, self.region)
-                
                 campaigns = api.get_campaigns()
                 active_campaigns = [c for c in campaigns if c.state == 'enabled']
                 
